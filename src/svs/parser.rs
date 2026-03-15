@@ -380,6 +380,12 @@ fn bigtiff_ifd_entries_to_layout<R: Read + Seek>(
 
     let mut width: u32 = 0;
     let mut height: u32 = 0;
+    let mut compression: Option<u16> = None;
+    let mut description: Option<String> = None;
+    let mut new_subfile_type: Option<u64> = None;
+    let mut strip_offsets: Vec<u64> = Vec::new();
+    let mut rows_per_strip: Option<u32> = None;
+    let mut strip_byte_counts: Vec<u64> = Vec::new();
     let mut tile_width: Option<u32> = None;
     let mut tile_height: Option<u32> = None;
     let mut tile_offsets: Vec<u64> = Vec::new();
@@ -396,6 +402,30 @@ fn bigtiff_ifd_entries_to_layout<R: Read + Seek>(
                 if let Some(&h) = resolve_u64_values(r, entry, byte_order)?.first() {
                     height = h as u32;
                 }
+            }
+            tag::COMPRESSION => {
+                if let Some(&c) = resolve_u64_values(r, entry, byte_order)?.first() {
+                    compression = Some(c as u16);
+                }
+            }
+            tag::NEW_SUBFILE_TYPE => {
+                if let Some(&v) = resolve_u64_values(r, entry, byte_order)?.first() {
+                    new_subfile_type = Some(v);
+                }
+            }
+            tag::IMAGE_DESCRIPTION => {
+                description = Some(resolve_big_ascii(r, entry, byte_order)?);
+            }
+            tag::STRIP_OFFSETS => {
+                strip_offsets = resolve_u64_values(r, entry, byte_order)?;
+            }
+            tag::ROWS_PER_STRIP => {
+                if let Some(&rps) = resolve_u64_values(r, entry, byte_order)?.first() {
+                    rows_per_strip = Some(rps as u32);
+                }
+            }
+            tag::STRIP_BYTE_COUNTS => {
+                strip_byte_counts = resolve_u64_values(r, entry, byte_order)?;
             }
             tag::TILE_WIDTH => {
                 if let Some(&tw) = resolve_u64_values(r, entry, byte_order)?.first() {
@@ -417,18 +447,41 @@ fn bigtiff_ifd_entries_to_layout<R: Read + Seek>(
         }
     }
 
-    let data_units = tile_offsets
-        .iter()
-        .zip(tile_byte_counts.iter())
-        .enumerate()
-        .map(|(unit_index, (&offset, &length))| DataUnit {
-            kind: DataUnitKind::Tile,
-            offset,
-            length,
-            ifd_index,
-            unit_index,
-        })
-        .collect();
+    // Tiles take priority; fall back to strips.
+    let data_units = if !tile_offsets.is_empty() {
+        tile_offsets
+            .iter()
+            .zip(tile_byte_counts.iter())
+            .enumerate()
+            .map(|(unit_index, (&offset, &length))| DataUnit {
+                kind: DataUnitKind::Tile,
+                offset,
+                length,
+                ifd_index,
+                unit_index,
+            })
+            .collect()
+    } else {
+        strip_offsets
+            .iter()
+            .zip(strip_byte_counts.iter())
+            .enumerate()
+            .map(|(unit_index, (&offset, &length))| DataUnit {
+                kind: DataUnitKind::Strip,
+                offset,
+                length,
+                ifd_index,
+                unit_index,
+            })
+            .collect()
+    };
+
+    let is_strip = tile_offsets.is_empty();
+    let associated_image = detect_associated_image(
+        is_strip,
+        new_subfile_type.map(|v| v as u32),
+        description.as_deref(),
+    );
 
     Ok(crate::svs::layout::Ifd {
         index: ifd_index,
@@ -436,8 +489,10 @@ fn bigtiff_ifd_entries_to_layout<R: Read + Seek>(
         height,
         tile_width,
         tile_height,
-        compression: None,
-        description: None,
+        rows_per_strip,
+        compression,
+        description,
+        associated_image,
         data_units,
     })
 }
@@ -513,6 +568,50 @@ pub fn resolve_u32_values<R: Read + Seek>(
 }
 
 // ---------------------------------------------------------------------------
+// ASCII value resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a Classic TIFF ASCII tag value as a `String`.
+///
+/// ASCII entries are null-terminated; trailing nulls are stripped.
+fn resolve_ascii<R: Read + Seek>(
+    r: &mut R,
+    entry: &RawIfdEntry,
+    byte_order: ByteOrder,
+) -> Result<String, ParseError> {
+    let count = entry.count as usize;
+    let bytes = if entry.is_inline() {
+        entry.value_bytes[..count.min(4)].to_vec()
+    } else {
+        let offset = entry.value_as_offset(byte_order);
+        r.seek(SeekFrom::Start(offset as u64))?;
+        let mut buf = vec![0u8; count];
+        r.read_exact(&mut buf)?;
+        buf
+    };
+    Ok(String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string())
+}
+
+/// Resolve a BigTIFF ASCII tag value as a `String`.
+fn resolve_big_ascii<R: Read + Seek>(
+    r: &mut R,
+    entry: &RawBigIfdEntry,
+    byte_order: ByteOrder,
+) -> Result<String, ParseError> {
+    let count = entry.count as usize;
+    let bytes = if entry.is_inline() {
+        entry.value_bytes[..count.min(8)].to_vec()
+    } else {
+        let offset = entry.value_as_offset(byte_order);
+        r.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; count];
+        r.read_exact(&mut buf)?;
+        buf
+    };
+    Ok(String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Layout construction
 // ---------------------------------------------------------------------------
 
@@ -520,6 +619,110 @@ pub fn resolve_u32_values<R: Read + Seek>(
 /// from `r` as needed.
 ///
 /// Only the Phase 1 tags are extracted; other tags are silently skipped.
+/// Determine whether an IFD represents an associated (non-primary) image.
+///
+/// Rules (applied in order):
+/// 1. Strip-organised AND description contains "label" (case-insensitive)  →  Label
+/// 2. Strip-organised AND description contains "macro" (case-insensitive)  →  Macro
+/// 3. `NewSubfileType` == 1  →  Thumbnail
+/// 4. Strip-organised with no description clue  →  None (resolved later by size comparison)
+/// 5. Tiled IFD  →  None (primary pyramid level)
+///
+/// Description is checked before `NewSubfileType` because SVS files can set
+/// `NewSubfileType = 1` on label/macro IFDs while also naming them in the description;
+/// the explicit name is the more reliable signal.
+fn detect_associated_image(
+    is_strip: bool,
+    new_subfile_type: Option<u32>,
+    description: Option<&str>,
+) -> Option<crate::svs::layout::AssociatedImageKind> {
+    use crate::svs::layout::AssociatedImageKind;
+
+    if is_strip {
+        if let Some(desc) = description {
+            let lower = desc.to_ascii_lowercase();
+            if lower.contains("label") {
+                return Some(AssociatedImageKind::Label);
+            }
+            if lower.contains("macro") {
+                return Some(AssociatedImageKind::Macro);
+            }
+        }
+        if new_subfile_type == Some(0) {
+            return Some(AssociatedImageKind::Thumbnail);
+        }
+    }
+    // Strip IFD with no description clue — caller must resolve via size comparison.
+    None
+}
+
+/// Resolve label/macro classification for strip IFDs whose kind could not be determined
+/// from the `ImageDescription` tag alone.
+///
+/// After per-IFD description-based detection, some strip IFDs may still be unresolved
+/// (e.g. if only one of the two has a matching keyword in its description).  This function
+/// handles two cases:
+///
+/// - **Two unresolved** strip IFDs: the one with the smaller pixel area is `Label`, the
+///   larger is `Macro`.
+/// - **One unresolved** strip IFD, and exactly one already-classified non-thumbnail strip
+///   IFD: the unresolved one receives the complement type (`Label` ↔ `Macro`).
+///
+/// Any other combination is left unresolved.
+pub(crate) fn resolve_label_macro(ifds: &mut Vec<crate::svs::layout::Ifd>) {
+    use crate::svs::layout::AssociatedImageKind;
+
+    // Indices of strip IFDs not yet classified.
+    let unresolved: Vec<usize> = ifds
+        .iter()
+        .enumerate()
+        .filter(|(_, ifd)| ifd.tile_width.is_none() && ifd.associated_image.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    let area = |idx: usize| -> u64 {
+        let ifd = &ifds[idx];
+        (ifd.width as u64) * (ifd.height as u64)
+    };
+
+    match unresolved.len() {
+        2 => {
+            let (label_idx, macro_idx) = if area(unresolved[0]) <= area(unresolved[1]) {
+                (unresolved[0], unresolved[1])
+            } else {
+                (unresolved[1], unresolved[0])
+            };
+            ifds[label_idx].associated_image = Some(AssociatedImageKind::Label);
+            ifds[macro_idx].associated_image = Some(AssociatedImageKind::Macro);
+        }
+        1 => {
+            // One already-classified non-thumbnail strip IFD → assign the complement.
+            let classified: Vec<(usize, &AssociatedImageKind)> = ifds
+                .iter()
+                .enumerate()
+                .filter(|(_, ifd)| {
+                    ifd.tile_width.is_none()
+                        && matches!(
+                            ifd.associated_image,
+                            Some(AssociatedImageKind::Label) | Some(AssociatedImageKind::Macro)
+                        )
+                })
+                .map(|(i, ifd)| (i, ifd.associated_image.as_ref().unwrap()))
+                .collect();
+
+            if classified.len() == 1 {
+                let complement = match classified[0].1 {
+                    AssociatedImageKind::Macro => AssociatedImageKind::Label,
+                    AssociatedImageKind::Label => AssociatedImageKind::Macro,
+                    AssociatedImageKind::Thumbnail => return,
+                };
+                ifds[unresolved[0]].associated_image = Some(complement);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn ifd_entries_to_layout<R: Read + Seek>(
     r: &mut R,
     ifd_index: usize,
@@ -531,6 +734,12 @@ fn ifd_entries_to_layout<R: Read + Seek>(
 
     let mut width: u32 = 0;
     let mut height: u32 = 0;
+    let mut compression: Option<u16> = None;
+    let mut description: Option<String> = None;
+    let mut new_subfile_type: Option<u32> = None;
+    let mut strip_offsets: Vec<u32> = Vec::new();
+    let mut rows_per_strip: Option<u32> = None;
+    let mut strip_byte_counts: Vec<u32> = Vec::new();
     let mut tile_width: Option<u32> = None;
     let mut tile_height: Option<u32> = None;
     let mut tile_offsets: Vec<u32> = Vec::new();
@@ -549,6 +758,33 @@ fn ifd_entries_to_layout<R: Read + Seek>(
                 if let Some(&h) = v.first() {
                     height = h;
                 }
+            }
+            tag::COMPRESSION => {
+                let v = resolve_u32_values(r, entry, byte_order)?;
+                if let Some(&c) = v.first() {
+                    compression = Some(c as u16);
+                }
+            }
+            tag::NEW_SUBFILE_TYPE => {
+                let v = resolve_u32_values(r, entry, byte_order)?;
+                if let Some(&nst) = v.first() {
+                    new_subfile_type = Some(nst);
+                }
+            }
+            tag::IMAGE_DESCRIPTION => {
+                description = Some(resolve_ascii(r, entry, byte_order)?);
+            }
+            tag::STRIP_OFFSETS => {
+                strip_offsets = resolve_u32_values(r, entry, byte_order)?;
+            }
+            tag::ROWS_PER_STRIP => {
+                let v = resolve_u32_values(r, entry, byte_order)?;
+                if let Some(&rps) = v.first() {
+                    rows_per_strip = Some(rps);
+                }
+            }
+            tag::STRIP_BYTE_COUNTS => {
+                strip_byte_counts = resolve_u32_values(r, entry, byte_order)?;
             }
             tag::TILE_WIDTH => {
                 let v = resolve_u32_values(r, entry, byte_order)?;
@@ -572,18 +808,41 @@ fn ifd_entries_to_layout<R: Read + Seek>(
         }
     }
 
-    let data_units = tile_offsets
-        .iter()
-        .zip(tile_byte_counts.iter())
-        .enumerate()
-        .map(|(unit_index, (&offset, &length))| DataUnit {
-            kind: DataUnitKind::Tile,
-            offset: offset as u64,
-            length: length as u64,
-            ifd_index,
-            unit_index,
-        })
-        .collect();
+    // Tiles take priority; fall back to strips.
+    let data_units = if !tile_offsets.is_empty() {
+        tile_offsets
+            .iter()
+            .zip(tile_byte_counts.iter())
+            .enumerate()
+            .map(|(unit_index, (&offset, &length))| DataUnit {
+                kind: DataUnitKind::Tile,
+                offset: offset as u64,
+                length: length as u64,
+                ifd_index,
+                unit_index,
+            })
+            .collect()
+    } else {
+        strip_offsets
+            .iter()
+            .zip(strip_byte_counts.iter())
+            .enumerate()
+            .map(|(unit_index, (&offset, &length))| DataUnit {
+                kind: DataUnitKind::Strip,
+                offset: offset as u64,
+                length: length as u64,
+                ifd_index,
+                unit_index,
+            })
+            .collect()
+    };
+
+    let is_strip = tile_offsets.is_empty();
+    let associated_image = detect_associated_image(
+        is_strip,
+        new_subfile_type,
+        description.as_deref(),
+    );
 
     Ok(crate::svs::layout::Ifd {
         index: ifd_index,
@@ -591,8 +850,10 @@ fn ifd_entries_to_layout<R: Read + Seek>(
         height,
         tile_width,
         tile_height,
-        compression: None,
-        description: None,
+        rows_per_strip,
+        compression,
+        description,
+        associated_image,
         data_units,
     })
 }
@@ -626,6 +887,7 @@ pub fn parse_svs_file<R: Read + Seek>(
         for (ifd_index, entries) in raw_ifds.into_iter().enumerate() {
             ifds.push(bigtiff_ifd_entries_to_layout(r, ifd_index, &entries, byte_order)?);
         }
+        resolve_label_macro(&mut ifds);
         Ok(crate::svs::layout::SvsFile { path, ifds, raw_len: file_len })
     } else {
         let header = parse_header(r)?;
@@ -635,6 +897,7 @@ pub fn parse_svs_file<R: Read + Seek>(
         for (ifd_index, entries) in raw_ifds.into_iter().enumerate() {
             ifds.push(ifd_entries_to_layout(r, ifd_index, &entries, byte_order)?);
         }
+        resolve_label_macro(&mut ifds);
         Ok(crate::svs::layout::SvsFile { path, ifds, raw_len: file_len })
     }
 }
@@ -1038,7 +1301,7 @@ mod tests {
         data.extend_from_slice(&6u64.to_le_bytes());
 
         // Helper: emit one 20-byte BigTIFF IFD entry.
-        let mut entry = |tag: u16, typ: u16, count: u64, value: u64| {
+        let entry = |tag: u16, typ: u16, count: u64, value: u64| {
             let mut e = Vec::with_capacity(20);
             e.extend_from_slice(&tag.to_le_bytes());
             e.extend_from_slice(&typ.to_le_bytes());
@@ -1125,5 +1388,178 @@ mod tests {
         assert_eq!(ifd.height, 32);
         assert!(ifd.tile_width.is_none());
         assert!(ifd.data_units.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_associated_image
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn thumbnail_detected_by_new_subfile_type_1() {
+        use crate::svs::layout::AssociatedImageKind;
+        assert_eq!(
+            detect_associated_image(false, Some(1), None),
+            Some(AssociatedImageKind::Thumbnail)
+        );
+        // Strip with NewSubfileType=1 and no description clue → Thumbnail.
+        assert_eq!(
+            detect_associated_image(true, Some(1), None),
+            Some(AssociatedImageKind::Thumbnail)
+        );
+    }
+
+    #[test]
+    fn description_takes_priority_over_new_subfile_type() {
+        use crate::svs::layout::AssociatedImageKind;
+        // NewSubfileType=1 but description says "label" → Label wins.
+        assert_eq!(
+            detect_associated_image(true, Some(1), Some("label")),
+            Some(AssociatedImageKind::Label)
+        );
+        assert_eq!(
+            detect_associated_image(true, Some(1), Some("macro")),
+            Some(AssociatedImageKind::Macro)
+        );
+    }
+
+    #[test]
+    fn label_detected_by_description() {
+        use crate::svs::layout::AssociatedImageKind;
+        assert_eq!(
+            detect_associated_image(true, None, Some("label")),
+            Some(AssociatedImageKind::Label)
+        );
+        // Case-insensitive.
+        assert_eq!(
+            detect_associated_image(true, None, Some("Aperio Image Library v12.0\r\nlabel")),
+            Some(AssociatedImageKind::Label)
+        );
+    }
+
+    #[test]
+    fn macro_detected_by_description() {
+        use crate::svs::layout::AssociatedImageKind;
+        assert_eq!(
+            detect_associated_image(true, None, Some("macro")),
+            Some(AssociatedImageKind::Macro)
+        );
+        assert_eq!(
+            detect_associated_image(true, None, Some("Aperio Image Library\r\nmacro")),
+            Some(AssociatedImageKind::Macro)
+        );
+    }
+
+    #[test]
+    fn strip_ifd_without_description_clue_is_unresolved() {
+        // No description → neither label nor macro yet; resolved later by resolve_label_macro.
+        assert_eq!(detect_associated_image(true, None, None), None);
+        assert_eq!(detect_associated_image(true, None, Some("some unrelated text")), None);
+    }
+
+    #[test]
+    fn tiled_ifd_not_classified_as_associated() {
+        // Tiled IFDs are pyramid levels regardless of description.
+        assert_eq!(detect_associated_image(false, None, None), None);
+        assert_eq!(detect_associated_image(false, None, Some("label")), None);
+    }
+
+    #[test]
+    fn primary_image_not_flagged_as_associated() {
+        // NewSubfileType = 0 → full-resolution primary.
+        assert_eq!(detect_associated_image(false, Some(0), None), None);
+        // No tags, tiled → primary pyramid level.
+        assert_eq!(detect_associated_image(false, None, None), None);
+    }
+
+    #[test]
+    fn resolve_label_macro_by_size() {
+        use crate::svs::layout::{AssociatedImageKind, DataUnit, DataUnitKind, Ifd};
+
+        let make_strip_ifd = |index: usize, width: u32, height: u32| Ifd {
+            index,
+            width,
+            height,
+            tile_width: None,
+            tile_height: None,
+            rows_per_strip: Some(1),
+            compression: None,
+            description: None,
+            associated_image: None,
+            data_units: vec![DataUnit {
+                kind: DataUnitKind::Strip,
+                offset: 0,
+                length: 1,
+                ifd_index: index,
+                unit_index: 0,
+            }],
+        };
+
+        let mut ifds = vec![
+            make_strip_ifd(0, 1280, 431), // macro (larger area)
+            make_strip_ifd(1, 387, 463),  // label (smaller area)
+        ];
+        resolve_label_macro(&mut ifds);
+        assert_eq!(ifds[0].associated_image, Some(AssociatedImageKind::Macro));
+        assert_eq!(ifds[1].associated_image, Some(AssociatedImageKind::Label));
+    }
+
+    #[test]
+    fn resolve_label_macro_one_described_one_plain() {
+        use crate::svs::layout::{AssociatedImageKind, DataUnit, DataUnitKind, Ifd};
+
+        // Macro identified by description; label has no description clue.
+        let make_strip_ifd =
+            |index: usize, width: u32, height: u32, kind: Option<AssociatedImageKind>| Ifd {
+                index,
+                width,
+                height,
+                tile_width: None,
+                tile_height: None,
+                rows_per_strip: Some(1),
+                compression: None,
+                description: None,
+                associated_image: kind,
+                data_units: vec![DataUnit {
+                    kind: DataUnitKind::Strip,
+                    offset: 0,
+                    length: 1,
+                    ifd_index: index,
+                    unit_index: 0,
+                }],
+            };
+
+        let mut ifds = vec![
+            make_strip_ifd(0, 1280, 431, Some(AssociatedImageKind::Macro)), // already classified
+            make_strip_ifd(1, 387, 463, None),                              // unresolved
+        ];
+        resolve_label_macro(&mut ifds);
+        assert_eq!(ifds[0].associated_image, Some(AssociatedImageKind::Macro));
+        assert_eq!(ifds[1].associated_image, Some(AssociatedImageKind::Label));
+    }
+
+    #[test]
+    fn resolve_label_macro_leaves_single_candidate_unresolved() {
+        use crate::svs::layout::{DataUnit, DataUnitKind, Ifd};
+
+        let mut ifds = vec![Ifd {
+            index: 0,
+            width: 500,
+            height: 300,
+            tile_width: None,
+            tile_height: None,
+            rows_per_strip: Some(1),
+            compression: None,
+            description: None,
+            associated_image: None,
+            data_units: vec![DataUnit {
+                kind: DataUnitKind::Strip,
+                offset: 0,
+                length: 1,
+                ifd_index: 0,
+                unit_index: 0,
+            }],
+        }];
+        resolve_label_macro(&mut ifds);
+        assert_eq!(ifds[0].associated_image, None);
     }
 }

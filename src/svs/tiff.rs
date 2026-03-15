@@ -166,8 +166,17 @@ impl RawBigIfdEntry {
 pub mod tag {
     pub const IMAGE_WIDTH: u16 = 256;
     pub const IMAGE_LENGTH: u16 = 257;
+    pub const COMPRESSION: u16 = 259;
+    pub const IMAGE_DESCRIPTION: u16 = 270;
+    pub const STRIP_OFFSETS: u16 = 273;
+    pub const ROWS_PER_STRIP: u16 = 278;
+    pub const STRIP_BYTE_COUNTS: u16 = 279;
     pub const TILE_WIDTH: u16 = 322;
     pub const TILE_LENGTH: u16 = 323;
     pub const TILE_OFFSETS: u16 = 324;
     pub const TILE_BYTE_COUNTS: u16 = 325;
+    /// Indicates whether this IFD is a primary image or a variant (reduced,
+    /// page, mask).  0 = full-resolution primary image; non-zero values encode
+    /// TIFF-defined bit flags.
+    pub const NEW_SUBFILE_TYPE: u16 = 254;
 }

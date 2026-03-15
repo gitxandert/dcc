@@ -25,12 +25,37 @@ pub struct Ifd {
     pub tile_width: Option<u32>,
     /// Tile height in pixels, if the image is tiled.
     pub tile_height: Option<u32>,
+    /// Rows per strip, if the image is strip-organized.
+    pub rows_per_strip: Option<u32>,
     /// TIFF compression tag value (e.g. 1 = none, 7 = JPEG).
     pub compression: Option<u16>,
     /// Contents of the ImageDescription tag, if present.
     pub description: Option<String>,
+    /// Set when this IFD is detected as an associated (non-primary) image.
+    pub associated_image: Option<AssociatedImageKind>,
     /// Ordered list of data units (tiles or strips) in this IFD.
     pub data_units: Vec<DataUnit>,
+}
+
+/// The role of an IFD that is not a primary pyramid level.
+///
+/// Detection rules (applied in order):
+/// 1. `NewSubfileType` == 1  →  `Thumbnail`
+/// 2. Strip-organised AND `ImageDescription` contains `"label"` (case-insensitive)  →  `Label`
+/// 3. Strip-organised AND `ImageDescription` contains `"macro"` (case-insensitive)  →  `Macro`
+/// 4. Strip-organised with no description clue: resolved after all IFDs are parsed by
+///    comparing the two unresolved strip IFDs — the larger one (by pixel area) is `Macro`,
+///    the smaller is `Label`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssociatedImageKind {
+    /// The slide label — identified by description or (as fallback) the smaller of two
+    /// unresolved strip IFDs.
+    Label,
+    /// The macro/overview photograph — identified by description or (as fallback) the
+    /// larger of two unresolved strip IFDs.
+    Macro,
+    /// Reduced-resolution thumbnail (`NewSubfileType` == 1).
+    Thumbnail,
 }
 
 /// A single addressable data payload within an SVS file.

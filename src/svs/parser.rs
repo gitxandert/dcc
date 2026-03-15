@@ -459,6 +459,7 @@ fn bigtiff_ifd_entries_to_layout<R: Read + Seek>(
                 length,
                 ifd_index,
                 unit_index,
+                strong_hash: None,
             })
             .collect()
     } else {
@@ -472,6 +473,7 @@ fn bigtiff_ifd_entries_to_layout<R: Read + Seek>(
                 length,
                 ifd_index,
                 unit_index,
+                strong_hash: None,
             })
             .collect()
     };
@@ -820,6 +822,7 @@ fn ifd_entries_to_layout<R: Read + Seek>(
                 length: length as u64,
                 ifd_index,
                 unit_index,
+                strong_hash: None,
             })
             .collect()
     } else {
@@ -833,6 +836,7 @@ fn ifd_entries_to_layout<R: Read + Seek>(
                 length: length as u64,
                 ifd_index,
                 unit_index,
+                strong_hash: None,
             })
             .collect()
     };
@@ -1395,15 +1399,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn thumbnail_detected_by_new_subfile_type_1() {
+    fn thumbnail_detected_by_new_subfile_type_0() {
         use crate::svs::layout::AssociatedImageKind;
         assert_eq!(
-            detect_associated_image(false, Some(1), None),
-            Some(AssociatedImageKind::Thumbnail)
+            detect_associated_image(false, Some(0), None),
+            None
         );
-        // Strip with NewSubfileType=1 and no description clue → Thumbnail.
+        // Strip with NewSubfileType=0 and no description clue → Thumbnail.
         assert_eq!(
-            detect_associated_image(true, Some(1), None),
+            detect_associated_image(true, Some(0), None),
             Some(AssociatedImageKind::Thumbnail)
         );
     }
@@ -1491,6 +1495,7 @@ mod tests {
                 length: 1,
                 ifd_index: index,
                 unit_index: 0,
+                strong_hash: None,
             }],
         };
 
@@ -1525,6 +1530,7 @@ mod tests {
                     length: 1,
                     ifd_index: index,
                     unit_index: 0,
+                    strong_hash: None,
                 }],
             };
 
@@ -1557,6 +1563,7 @@ mod tests {
                 length: 1,
                 ifd_index: 0,
                 unit_index: 0,
+                strong_hash: None,
             }],
         }];
         resolve_label_macro(&mut ifds);

@@ -70,6 +70,8 @@ pub struct DataUnit {
     pub ifd_index: usize,
     /// Zero-based index of this unit within its IFD.
     pub unit_index: usize,
+    /// SHA-256 hash of the payload bytes, populated by the fingerprinting stage.
+    pub strong_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

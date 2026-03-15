@@ -49,6 +49,12 @@ pub enum FieldType {
     SRational,
     Float,
     Double,
+    /// BigTIFF 8-byte unsigned integer (type code 16).
+    Long8,
+    /// BigTIFF 8-byte signed integer (type code 17).
+    SLong8,
+    /// BigTIFF 8-byte IFD offset (type code 18).
+    Ifd8,
     Unknown(u16),
 }
 
@@ -67,6 +73,9 @@ impl FieldType {
             10 => FieldType::SRational,
             11 => FieldType::Float,
             12 => FieldType::Double,
+            16 => FieldType::Long8,
+            17 => FieldType::SLong8,
+            18 => FieldType::Ifd8,
             other => FieldType::Unknown(other),
         }
     }
@@ -81,6 +90,7 @@ impl FieldType {
             FieldType::Short | FieldType::SShort => Some(2),
             FieldType::Long | FieldType::SLong | FieldType::Float => Some(4),
             FieldType::Rational | FieldType::SRational | FieldType::Double => Some(8),
+            FieldType::Long8 | FieldType::SLong8 | FieldType::Ifd8 => Some(8),
             FieldType::Unknown(_) => None,
         }
     }
@@ -113,6 +123,40 @@ impl RawIfdEntry {
     /// True if the value fits inline in the 4-byte value field.
     pub fn is_inline(&self) -> bool {
         self.payload_size().map(|s| s <= 4).unwrap_or(false)
+    }
+}
+
+/// One raw 20-byte BigTIFF IFD entry, before value resolution.
+///
+/// BigTIFF IFD entries differ from Classic TIFF in that:
+/// - `count` is a u64 (8 bytes) instead of u32 (4 bytes)
+/// - the value/offset field is 8 bytes instead of 4 bytes
+#[derive(Debug, Clone)]
+pub struct RawBigIfdEntry {
+    pub tag: u16,
+    pub field_type: FieldType,
+    pub count: u64,
+    /// The raw 8 bytes of the value/offset field, in file byte order.
+    pub value_bytes: [u8; 8],
+}
+
+impl RawBigIfdEntry {
+    /// Interpret `value_bytes` as a file offset (u64 in `byte_order`).
+    pub fn value_as_offset(&self, byte_order: ByteOrder) -> u64 {
+        match byte_order {
+            ByteOrder::LittleEndian => u64::from_le_bytes(self.value_bytes),
+            ByteOrder::BigEndian => u64::from_be_bytes(self.value_bytes),
+        }
+    }
+
+    /// Total byte size of the value payload, or `None` for unknown field types.
+    pub fn payload_size(&self) -> Option<u64> {
+        self.field_type.element_size().map(|s| s * self.count)
+    }
+
+    /// True if the value fits inline in the 8-byte value field.
+    pub fn is_inline(&self) -> bool {
+        self.payload_size().map(|s| s <= 8).unwrap_or(false)
     }
 }
 

@@ -3,7 +3,6 @@
 use std::fs::File;
 
 use crate::svs::parser::parse_svs_file;
-use crate::svs::tiff::ByteOrder;
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     // Skip the binary name.
@@ -22,7 +21,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn cmd_inspect(path: &str) -> Result<(), String> {
-    use crate::svs::parser::parse_header;
+    use crate::svs::tiff::{BYTE_ORDER_BE, BYTE_ORDER_LE};
+    use std::io::Read;
 
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("{path}: {e}"))?
@@ -30,11 +30,16 @@ fn cmd_inspect(path: &str) -> Result<(), String> {
 
     let mut f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
 
-    // Read byte order from header first; parse_svs_file will re-seek to 0.
-    let hdr = parse_header(&mut f).map_err(|e| format!("{path}: {e}"))?;
-    let bo_label = match hdr.byte_order {
-        ByteOrder::LittleEndian => "little-endian",
-        ByteOrder::BigEndian => "big-endian",
+    // Determine byte order from the BOM (first 2 bytes).  Works for both
+    // Classic TIFF (magic 42) and BigTIFF (magic 43); parse_svs_file handles
+    // the rest and will re-seek to 0 internally.
+    let mut bom_buf = [0u8; 2];
+    f.read_exact(&mut bom_buf).map_err(|e| format!("{path}: {e}"))?;
+    let bom = u16::from_le_bytes(bom_buf);
+    let bo_label = match bom {
+        BYTE_ORDER_LE => "little-endian",
+        BYTE_ORDER_BE => "big-endian",
+        _ => return Err(format!("{path}: unrecognised byte-order mark: 0x{bom:04X}")),
     };
 
     let svs =

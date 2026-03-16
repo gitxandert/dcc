@@ -33,7 +33,7 @@ pub struct UnitRecord {
 }
 
 /// All data units extracted from a single SVS file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnitManifest {
     /// Path to the source file.
     pub path: PathBuf,

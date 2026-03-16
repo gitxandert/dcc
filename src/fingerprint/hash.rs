@@ -4,7 +4,96 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use sha2::{Digest, Sha256};
 
-use crate::svs::layout::DataUnit;
+use crate::svs::layout::{DataUnit, DataUnitKind};
+
+// ---------------------------------------------------------------------------
+// Coarse fingerprint
+// ---------------------------------------------------------------------------
+
+/// Number of bytes sampled from each window (start, middle, end) when
+/// computing a coarse fingerprint.  Small enough to remain cheap; large
+/// enough to distinguish most real payloads.
+pub const COARSE_SAMPLE_BYTES: usize = 64;
+
+/// FNV-1a 64-bit offset basis.
+const FNV_OFFSET: u64 = 14695981039346656037;
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 1099511628211;
+
+fn fnv1a_feed(state: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *state ^= b as u64;
+        *state = state.wrapping_mul(FNV_PRIME);
+    }
+}
+
+/// Compute a coarse fingerprint for `unit` using bounded payload sampling.
+///
+/// Reads at most `3 × COARSE_SAMPLE_BYTES` from the unit: a window at the
+/// start, a window at the midpoint, and a window at the end (the latter two
+/// are skipped for very small units where they would overlap with the first).
+/// The sampled bytes are mixed with structural fields (kind, length,
+/// compression) via FNV-1a.
+///
+/// This value is suitable for **candidate matching only**.  It is not a
+/// proof of exact byte equality — use `hash_unit` for that.
+pub fn coarse_fingerprint<R: Read + Seek>(
+    reader: &mut R,
+    unit: &DataUnit,
+    file_len: u64,
+    compression: Option<u16>,
+) -> Result<u64, HashError> {
+    let end = unit
+        .offset
+        .checked_add(unit.length)
+        .ok_or(HashError::OutOfBounds { offset: unit.offset, length: unit.length })?;
+    if end > file_len {
+        return Err(HashError::OutOfBounds { offset: unit.offset, length: unit.length });
+    }
+
+    // Seed with structural fields so units with identical sampled bytes but
+    // different kinds, sizes, or compression schemes still diverge.
+    let kind_byte: u8 = match unit.kind {
+        DataUnitKind::Tile => 0,
+        DataUnitKind::Strip => 1,
+        DataUnitKind::MetadataBlob => 2,
+        DataUnitKind::AssociatedImage => 3,
+    };
+    let mut state = FNV_OFFSET;
+    fnv1a_feed(&mut state, &[kind_byte]);
+    fnv1a_feed(&mut state, &unit.length.to_le_bytes());
+    if let Some(c) = compression {
+        fnv1a_feed(&mut state, &c.to_le_bytes());
+    }
+
+    // Read `n` bytes at absolute file offset `pos` and mix into state.
+    let mut sample_at = |pos: u64, n: usize| -> Result<(), HashError> {
+        let mut buf = [0u8; COARSE_SAMPLE_BYTES];
+        reader.seek(SeekFrom::Start(pos))?;
+        reader.read_exact(&mut buf[..n])?;
+        fnv1a_feed(&mut state, &buf[..n]);
+        Ok(())
+    };
+
+    let n = (unit.length as usize).min(COARSE_SAMPLE_BYTES);
+
+    // First window.
+    sample_at(unit.offset, n)?;
+
+    // Middle window — only when it does not overlap with the first window.
+    if unit.length > (2 * COARSE_SAMPLE_BYTES) as u64 {
+        let mid_off = unit.offset + unit.length / 2;
+        sample_at(mid_off, COARSE_SAMPLE_BYTES)?;
+    }
+
+    // Last window — only when it does not overlap with the first window.
+    if unit.length > COARSE_SAMPLE_BYTES as u64 {
+        let tail_off = unit.offset + unit.length - COARSE_SAMPLE_BYTES as u64;
+        sample_at(tail_off, COARSE_SAMPLE_BYTES)?;
+    }
+
+    Ok(state)
+}
 
 /// Hash errors that can arise during payload reading.
 #[derive(Debug)]
@@ -144,5 +233,80 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    // ── coarse_fingerprint ────────────────────────────────────────────────
+
+    #[test]
+    fn coarse_fp_is_stable() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+        let unit = make_unit(0, data.len() as u64);
+        let file_len = data.len() as u64;
+
+        let fp1 = coarse_fingerprint(&mut Cursor::new(&data), &unit, file_len, None).unwrap();
+        let fp2 = coarse_fingerprint(&mut Cursor::new(&data), &unit, file_len, None).unwrap();
+        assert_eq!(fp1, fp2, "same input must produce the same coarse fingerprint");
+    }
+
+    #[test]
+    fn coarse_fp_differs_for_distinct_payloads() {
+        let data_a: Vec<u8> = vec![0xAA; 256];
+        let data_b: Vec<u8> = vec![0xBB; 256];
+        let unit = make_unit(0, 256);
+        let file_len = 256;
+
+        let fp_a = coarse_fingerprint(&mut Cursor::new(&data_a), &unit, file_len, None).unwrap();
+        let fp_b = coarse_fingerprint(&mut Cursor::new(&data_b), &unit, file_len, None).unwrap();
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn coarse_fp_differs_for_different_lengths() {
+        // Same bytes at offset 0, but different lengths → different fingerprints
+        // because length is mixed into the structural seed.
+        let data: Vec<u8> = vec![0xCC; 256];
+        let unit_short = make_unit(0, 64);
+        let unit_long = make_unit(0, 256);
+        let file_len = 256;
+
+        let fp_short =
+            coarse_fingerprint(&mut Cursor::new(&data), &unit_short, file_len, None).unwrap();
+        let fp_long =
+            coarse_fingerprint(&mut Cursor::new(&data), &unit_long, file_len, None).unwrap();
+        assert_ne!(fp_short, fp_long);
+    }
+
+    #[test]
+    fn coarse_fp_differs_for_different_compression() {
+        let data: Vec<u8> = vec![0xDD; 128];
+        let unit = make_unit(0, 128);
+        let file_len = 128;
+
+        let fp_none =
+            coarse_fingerprint(&mut Cursor::new(&data), &unit, file_len, None).unwrap();
+        let fp_jpeg =
+            coarse_fingerprint(&mut Cursor::new(&data), &unit, file_len, Some(7)).unwrap();
+        assert_ne!(fp_none, fp_jpeg);
+    }
+
+    #[test]
+    fn coarse_fp_out_of_bounds_is_rejected() {
+        let data = b"short";
+        let unit = make_unit(3, 10);
+        let result = coarse_fingerprint(&mut Cursor::new(data), &unit, data.len() as u64, None);
+        assert!(matches!(result, Err(HashError::OutOfBounds { .. })));
+    }
+
+    #[test]
+    fn coarse_fp_small_unit_uses_only_first_window() {
+        // Unit smaller than COARSE_SAMPLE_BYTES — only the first window fires.
+        // Verify it does not panic and returns a consistent value.
+        let data: Vec<u8> = vec![0xEE; 16];
+        let unit = make_unit(0, 16);
+        let file_len = 16;
+
+        let fp1 = coarse_fingerprint(&mut Cursor::new(&data), &unit, file_len, None).unwrap();
+        let fp2 = coarse_fingerprint(&mut Cursor::new(&data), &unit, file_len, None).unwrap();
+        assert_eq!(fp1, fp2);
     }
 }

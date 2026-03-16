@@ -74,7 +74,7 @@ pub struct DataUnit {
     pub strong_hash: Option<[u8; 32]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataUnitKind {
     Tile,
     Strip,

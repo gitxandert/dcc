@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod svs;
 pub mod fingerprint;
+pub mod similarity;
 pub mod cluster;
 pub mod base;
 pub mod delta;

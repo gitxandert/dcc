@@ -127,91 +127,6 @@ impl ProgressBar {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Multi-worker progress display
-// ---------------------------------------------------------------------------
-
-/// One terminal row per parallel worker.  Each row shows the file the worker
-/// is currently processing and its per-unit progress within that file.
-///
-/// All public methods are no-ops on non-TTY stdout.
-struct WorkerBars {
-    n: usize,
-    is_tty: bool,
-    /// Serialises terminal writes so rows don't interleave.
-    lock: std::sync::Mutex<()>,
-}
-
-impl WorkerBars {
-    const BAR_WIDTH: usize = 26;
-
-    fn new(n: usize) -> Self {
-        Self { n, is_tty: libc_isatty(1), lock: std::sync::Mutex::new(()) }
-    }
-
-    /// Reserve `n` blank lines and hide the cursor.
-    fn init(&self) {
-        if !self.is_tty { return; }
-        let mut out = std::io::stdout();
-        write!(out, "\x1b[?25l").unwrap();
-        for _ in 0..self.n {
-            writeln!(out).unwrap();
-        }
-        out.flush().unwrap();
-    }
-
-    /// Redraw the row for `slot` in place.
-    ///
-    /// The cursor is always maintained at the line immediately below the
-    /// reserved area.  To update row `slot`:
-    ///   1. Move up `n − slot` lines to reach that row.
-    ///   2. Clear and write the new content.
-    ///   3. Move back down `n − slot` lines to restore the cursor.
-    fn update(&self, slot: usize, done: usize, total: usize, label: &str) {
-        if !self.is_tty || slot >= self.n { return; }
-        let _guard = self.lock.lock().unwrap();
-        let bar  = Self::format_bar(done, total);
-        let label = truncate(label, 28);
-        let content = format!("W{:<2} {bar}  {label}", slot);
-        let up = self.n - slot;
-        let mut out = std::io::stdout();
-        // Up to target row → clear & write → column 0 → back down.
-        write!(out, "\x1b[{up}A\r\x1b[2K{content}\r\x1b[{up}B").unwrap();
-        out.flush().unwrap();
-    }
-
-    /// Clear all reserved rows and restore the cursor, leaving no trace.
-    fn finish(&self) {
-        if !self.is_tty { return; }
-        let _guard = self.lock.lock().unwrap();
-        let mut out = std::io::stdout();
-        write!(out, "\x1b[{}A", self.n).unwrap();
-        for _ in 0..self.n {
-            write!(out, "\r\x1b[2K\n").unwrap();
-        }
-        write!(out, "\x1b[{}A", self.n).unwrap();
-        write!(out, "\x1b[?25h").unwrap();
-        out.flush().unwrap();
-    }
-
-    fn format_bar(current: usize, total: usize) -> String {
-        let w = Self::BAR_WIDTH;
-        let filled = if total == 0 { w } else { (current * w / total).min(w) };
-        let done = current >= total;
-        let mut bar = String::from("|\x1b[7m");
-        for i in 0..w {
-            if i < filled {
-                bar.push(' ');
-            } else if i == filled && !done {
-                bar.push_str("\x1b[0m");
-            } else {
-                bar.push(' ');
-            }
-        }
-        bar.push_str("\x1b[0m|");
-        format!("{bar} {current}/{total}")
-    }
-}
 
 /// Returns true if file descriptor `fd` refers to a terminal.
 ///
@@ -263,42 +178,56 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             cmd_fingerprint(&path, json)
         }
         Some("similarity") => {
-            let mut confirm = false;
-            let mut workers: usize = 4;
+            let mut min_score: Option<f64> = None;
+            let mut top_pairs: Option<usize> = None;
+            let mut json = false;
             let mut dir: Option<String> = None;
-            let mut want_workers = false;
+            let mut pending: Option<&str> = None;
+            let usage = "usage: dcc similarity [--min-score F] [--top N] [--json] <dir>";
             for arg in args {
-                if want_workers {
-                    workers = arg.parse::<usize>().map_err(|_| {
-                        "--workers requires a positive integer".to_string()
-                    })?;
-                    if workers == 0 {
-                        return Err("--workers must be at least 1".to_string());
+                if let Some(flag) = pending.take() {
+                    match flag {
+                        "--min-score" => {
+                            min_score = Some(arg.parse::<f64>().map_err(|_| {
+                                "--min-score requires a float".to_string()
+                            })?);
+                        }
+                        "--top" => {
+                            let n = arg.parse::<usize>().map_err(|_| {
+                                "--top requires a positive integer".to_string()
+                            })?;
+                            if n == 0 {
+                                return Err("--top must be at least 1".to_string());
+                            }
+                            top_pairs = Some(n);
+                        }
+                        _ => unreachable!(),
                     }
-                    want_workers = false;
                 } else {
                     match arg.as_str() {
-                        "--confirm" => confirm = true,
-                        "--workers" => want_workers = true,
+                        "--json" => json = true,
+                        "--min-score" | "--top" => {
+                            pending = Some(match arg.as_str() {
+                                "--min-score" => "--min-score",
+                                "--top" => "--top",
+                                _ => unreachable!(),
+                            })
+                        }
                         _ if dir.is_none() => dir = Some(arg),
-                        _ => return Err(
-                            "usage: dcc similarity [--confirm] [--workers N] <dir>".to_string()
-                        ),
+                        _ => return Err(usage.to_string()),
                     }
                 }
             }
-            if want_workers {
-                return Err("--workers requires a value".to_string());
+            if pending.is_some() {
+                return Err(format!("{}: flag requires a value", pending.unwrap()));
             }
-            let dir = dir.ok_or_else(|| {
-                "usage: dcc similarity [--confirm] [--workers N] <dir>".to_string()
-            })?;
-            cmd_similarity(&dir, confirm, workers)
+            let dir = dir.ok_or_else(|| usage.to_string())?;
+            cmd_similarity(&dir, min_score, top_pairs, json)
         }
         Some(cmd) => Err(format!(
-            "unknown command: {cmd}\nusage: dcc inspect <file> | dcc stats <dir> | dcc fingerprint [--json] <file> | dcc similarity [--confirm] [--workers N] <dir>"
+            "unknown command: {cmd}\nusage: dcc inspect <file> | dcc stats <dir> | dcc fingerprint [--json] <file> | dcc similarity [--min-score F] [--top N] [--json] <dir>"
         )),
-        None => Err("usage: dcc inspect <file> | dcc stats <dir> | dcc fingerprint [--json] <file> | dcc similarity [--confirm] [--workers N] <dir>".to_string()),
+        None => Err("usage: dcc inspect <file> | dcc stats <dir> | dcc fingerprint [--json] <file> | dcc similarity [--min-score F] [--top N] [--json] <dir>".to_string()),
     }
 }
 
@@ -855,12 +784,52 @@ fn write_fingerprint_json(
     Ok(())
 }
 
-fn cmd_similarity(dir: &str, confirm: bool, workers: usize) -> Result<(), String> {
-    use crate::fingerprint::manifest::build_manifest_from_reader_cb;
-    use crate::fingerprint::similarity::{confirm_candidates, find_candidates};
-    use rayon::prelude::*;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+fn write_structural_json(
+    w: &mut dyn std::io::Write,
+    profiles: &[crate::similarity::profile::FileProfile],
+    scores: &[crate::similarity::structural::StructuralScore],
+) -> std::io::Result<()> {
+    use crate::similarity::structural::formula_description;
+
+    let name_of = |file_id: usize| -> &str {
+        profiles
+            .iter()
+            .find(|p| p.file_id == file_id)
+            .and_then(|p| p.path.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+    };
+
+    writeln!(w, "{{")?;
+    writeln!(w, "  \"formula\": \"{}\",", formula_description())?;
+    writeln!(w, "  \"pair_count\": {},", scores.len())?;
+    writeln!(w, "  \"pairs\": [")?;
+    for (i, s) in scores.iter().enumerate() {
+        let comma = if i + 1 < scores.len() { "," } else { "" };
+        let name_a = name_of(s.file_id_a);
+        let name_b = name_of(s.file_id_b);
+        writeln!(
+            w,
+            "    {{\"file_a\": \"{name_a}\", \"file_b\": \"{name_b}\", \
+             \"score\": {:.6}, \"ifd_count\": {:.4}, \"structure\": {:.4}, \"description\": {:.4}}}{}",
+            s.score, s.ifd_count_score, s.structure_score, s.description_score, comma,
+        )?;
+    }
+    writeln!(w, "  ]")?;
+    writeln!(w, "}}")?;
+    Ok(())
+}
+
+fn cmd_similarity(
+    dir: &str,
+    min_score: Option<f64>,
+    top_pairs: Option<usize>,
+    json: bool,
+) -> Result<(), String> {
+    use crate::similarity::corpus::compute_corpus_stats;
+    use crate::similarity::profile::{build_profile, structural_signature};
+    use crate::similarity::structural::{formula_description, score_all_pairs};
+    use std::collections::BTreeMap;
 
     // ── collect .svs paths ───────────────────────────────────────────────────
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("{dir}: {e}"))?;
@@ -881,185 +850,263 @@ fn cmd_similarity(dir: &str, confirm: bool, workers: usize) -> Result<(), String
     }
     paths.sort();
 
-    // ── build manifests in parallel ──────────────────────────────────────────
-    // Each worker gets its own progress bar row showing per-unit progress for
-    // the file it is currently processing.  Workers claim a numbered slot from
-    // a pool so their rows are stable across files.
-    let total_files = paths.len();
-    let bars = WorkerBars::new(workers);
-    bars.init();
+    // ── parse all SVS files (metadata only) ─────────────────────────────────
+    let total = paths.len();
+    let mut bar = ProgressBar::new(total);
+    bar.init();
 
-    // Pool of available slot indices.  With `workers` threads and `workers`
-    // slots, there is always a slot free when a thread needs one.
-    let slots: Mutex<VecDeque<usize>> = Mutex::new((0..workers).collect());
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .build()
-        .map_err(|e| format!("failed to build thread pool: {e}"))?;
-
-    let mut raw: Vec<(usize, Result<_, String>)> = pool.install(|| {
-        paths.par_iter().enumerate().map(|(file_idx, path)| {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string();
-            // "3/12: slide_001.svs"
-            let label = format!("{}/{}: {}", file_idx + 1, total_files, name);
-
-            let slot = slots.lock().unwrap().pop_front()
-                .expect("slot available: pool size equals slot count");
-
-            let result = std::fs::metadata(path)
-                .map_err(|e| format!("{name}: {e}"))
-                .and_then(|meta| {
-                    File::open(path).map_err(|e| format!("{name}: {e}"))
-                        .and_then(|mut f| {
-                            build_manifest_from_reader_cb(
-                                &mut f,
-                                path.clone(),
-                                file_idx,
-                                meta.len(),
-                                |done, total| bars.update(slot, done, total, &label),
-                            )
-                            .map_err(|e| format!("{name}: {e}"))
-                        })
-                });
-
-            slots.lock().unwrap().push_back(slot);
-            (file_idx, result)
-        }).collect()
-    });
-
-    bars.finish();
-
-    // Restore original sorted order (rayon does not preserve it).
-    raw.sort_by_key(|(idx, _)| *idx);
-
-    let mut manifests = Vec::new();
+    let mut profiles = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    for (_, result) in raw {
+
+    for (i, path) in paths.iter().enumerate() {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let label = format!("{}/{}: {name}", i + 1, total);
+        bar.update(i, &label, None);
+
+        let result = std::fs::metadata(path)
+            .map_err(|e| format!("{name}: {e}"))
+            .and_then(|meta| {
+                File::open(path)
+                    .map_err(|e| format!("{name}: {e}"))
+                    .and_then(|mut f| {
+                        parse_svs_file(&mut f, path.clone(), meta.len())
+                            .map_err(|e| format!("{name}: {e}"))
+                    })
+            });
+
         match result {
-            Ok(m) => manifests.push(m),
+            Ok(svs) => profiles.push(build_profile(i, &svs)),
             Err(e) => warnings.push(e),
         }
     }
 
-    if manifests.is_empty() {
+    bar.update(total, "done", None);
+    bar.finish();
+
+    if profiles.is_empty() {
         return Err(format!("{dir}: no files could be parsed"));
     }
 
-    // ── candidate pass ───────────────────────────────────────────────────────
-    let candidates = find_candidates(&manifests);
-
-    // ── optional confirmation pass ───────────────────────────────────────────
-    let confirmed_result = if confirm {
-        match confirm_candidates(&candidates, &manifests) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warnings.push(format!("confirmation pass failed: {e}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // ── output ───────────────────────────────────────────────────────────────
-    let total_units: usize = manifests.iter().map(|m| m.units.len()).sum();
-    let total_payload: u64 = manifests
-        .iter()
-        .flat_map(|m| m.units.iter())
-        .map(|u| u.length)
-        .sum();
-
-    println!("directory:    {dir}");
-    println!("files:        {}", manifests.len());
-    println!("total units:  {total_units}");
-    println!("total bytes:  {}", format_size(total_payload));
+    // ── compute statistics ───────────────────────────────────────────────────
+    let stats = compute_corpus_stats(&profiles);
+    let mut scores = score_all_pairs(&profiles);
 
     let sep = "─".repeat(79);
 
-    // ── candidate summary ────────────────────────────────────────────────────
-    println!("\n{sep}");
-    println!("candidate summary");
-    println!("{sep}");
-    println!("  candidate groups (any file):  {:>8}", candidates.groups.len());
-    println!("  cross-file groups:            {:>8}", candidates.cross_file_groups);
-    println!("  units in candidate groups:    {:>8}", candidates.total_candidate_units);
-    println!("  candidate reusable bytes:     {:>8}", format_size(candidates.candidate_reusable_bytes));
+    // =========================================================================
+    // Section 1: Corpus overview
+    // =========================================================================
+    println!("directory:  {dir}");
+    println!("files:      {}", profiles.len());
+    println!("file sizes: {}  –  {}", format_size(stats.file_size_min), format_size(stats.file_size_max));
 
-    // ── per-file candidate table ─────────────────────────────────────────────
     println!("\n{sep}");
-    println!("per-file candidate overlap  (cross-file units only)");
+    println!("IFD count distribution");
     println!("{sep}");
-    println!(
-        "{:<30}  {:>8}  {:>10}  {:>12}  {:>7}",
-        "file", "units", "cand.units", "cand.bytes", "overlap"
-    );
-    println!("{sep}");
-    for pf in &candidates.per_file {
-        let name = pf.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        let pct = if pf.total_bytes > 0 {
-            format!("{:.1}%", 100.0 * pf.candidate_bytes as f64 / pf.total_bytes as f64)
-        } else {
-            "-".to_string()
-        };
-        println!(
-            "{:<30.30}  {:>8}  {:>10}  {:>12}  {:>7}",
-            name, pf.total_units, pf.candidate_units, format_size(pf.candidate_bytes), pct
-        );
+    for (count, freq) in &stats.ifd_count_dist {
+        let bar_len = (freq * 20 / profiles.len()).max(if *freq > 0 { 1 } else { 0 });
+        let bar = "#".repeat(bar_len);
+        let pct = 100.0 * (*freq as f64) / (profiles.len() as f64);
+        println!("  {count:>3} IFDs: {bar:<20}  {freq}/{} files  ({pct:.0}%)", profiles.len());
     }
 
-    // ── confirmed summary (if run) ───────────────────────────────────────────
-    if let Some(ref conf) = confirmed_result {
-        println!("\n{sep}");
-        println!("confirmed summary");
-        println!("{sep}");
-        println!("  confirmed groups:             {:>8}", conf.groups.len());
-        println!("  cross-file confirmed:         {:>8}", conf.cross_file_groups);
-        println!("  units in confirmed groups:    {:>8}", conf.total_confirmed_units);
-        println!("  confirmed reusable bytes:     {:>8}", format_size(conf.confirmed_reusable_bytes));
-        println!("  false positive groups:        {:>8}", conf.false_positive_groups);
-
-        // ── per-file confirmed table ─────────────────────────────────────────
-        println!("\n{sep}");
-        println!("per-file confirmed overlap  (cross-file units only)");
-        println!("{sep}");
+    // =========================================================================
+    // Section 2: IFD position analysis
+    // =========================================================================
+    println!("\n{sep}");
+    println!("IFD position analysis");
+    println!("{sep}");
+    for pos in &stats.ifd_positions {
         println!(
-            "{:<30}  {:>8}  {:>10}  {:>12}  {:>7}",
-            "file", "units", "conf.units", "conf.bytes", "overlap"
+            "  IFD {}  ({}/{} files)",
+            pos.position, pos.file_count, profiles.len()
         );
-        println!("{sep}");
 
-        // Build a lookup for total_bytes by file_id from the candidate per_file.
-        let total_bytes_by_id: std::collections::HashMap<usize, u64> = candidates
-            .per_file
+        // Width.
+        print!("    width:        ");
+        print_dist_compact(&pos.width_dist, pos.file_count, |v| format!("{v}px"));
+        println!();
+
+        // Height.
+        print!("    height:       ");
+        print_dist_compact(&pos.height_dist, pos.file_count, |v| format!("{v}px"));
+        println!();
+
+        // Compression.
+        print!("    compression:  ");
+        print_dist_compact(&pos.compression_dist, pos.file_count, |v| {
+            match v {
+                Some(code) => compression_label(*code),
+                None => "absent".to_string(),
+            }
+        });
+        println!();
+
+        // Layout / tile size.
+        print!("    layout:       ");
+        print_dist_compact(&pos.tile_size_dist, pos.file_count, |v| match v {
+            (Some(tw), Some(th)) => format!("tiled {tw}×{th}"),
+            _ => "strip-organised".to_string(),
+        });
+        println!();
+    }
+
+    // =========================================================================
+    // Section 3: Description patterns
+    // =========================================================================
+    println!("\n{sep}");
+    println!("description patterns");
+    println!("{sep}");
+
+    // Scanner / preamble distribution.
+    if !stats.preamble_freq.is_empty() {
+        println!("  scanner / preamble (text before first '|'):");
+        let mut preambles: Vec<(&str, usize)> = stats
+            .preamble_freq
             .iter()
-            .map(|pf| (pf.file_id, pf.total_bytes))
+            .map(|(k, &v)| (k.as_str(), v))
             .collect();
-
-        for pf in &conf.per_file {
-            let name = pf.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            let total_units = manifests
-                .iter()
-                .find(|m| m.file_id == pf.file_id)
-                .map(|m| m.units.len())
-                .unwrap_or(0);
-            let total_bytes = total_bytes_by_id.get(&pf.file_id).copied().unwrap_or(0);
-            let pct = if total_bytes > 0 {
-                format!("{:.1}%", 100.0 * pf.confirmed_bytes as f64 / total_bytes as f64)
-            } else {
-                "-".to_string()
-            };
+        preambles.sort_by(|a, b| b.1.cmp(&a.1));
+        for (pre, count) in &preambles {
             println!(
-                "{:<30.30}  {:>8}  {:>10}  {:>12}  {:>7}",
-                name, total_units, pf.confirmed_units, format_size(pf.confirmed_bytes), pct
+                "    {:>2}/{} files  \"{}\"",
+                count,
+                profiles.len(),
+                truncate(pre, 55)
             );
         }
     } else {
-        println!("\n  (run with --confirm to perform exact confirmation)");
+        println!("  (no ImageDescription fields found in any file)");
+    }
+
+    // Token frequency: tokens shared by >=2 files.
+    let common = stats.common_tokens(2);
+    if !common.is_empty() {
+        println!();
+        println!("  most common description tokens (≥2 files, sorted by frequency):");
+        // Show top 20 to keep output readable.
+        for (token, count) in common.iter().take(20) {
+            println!("    {:>2}/{} files  {}", count, profiles.len(), token);
+        }
+        if common.len() > 20 {
+            println!("    ... ({} more tokens omitted)", common.len() - 20);
+        }
+    }
+
+    // Tokens unique to a single file (anomalies / per-slide metadata).
+    let unique_tokens: Vec<&str> = stats.token_freq
+        .iter()
+        .filter(|&(_, &v)| v == 1)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !unique_tokens.is_empty() {
+        let shown: Vec<&str> = unique_tokens.iter().copied().take(10).collect();
+        let rest = unique_tokens.len().saturating_sub(10);
+        let sample = shown.join(", ");
+        if rest > 0 {
+            println!();
+            println!("  tokens unique to one file ({} total): {sample}, +{rest} more", unique_tokens.len());
+        } else {
+            println!();
+            println!("  tokens unique to one file ({}): {sample}", unique_tokens.len());
+        }
+    }
+
+    // =========================================================================
+    // Section 4: Structural groups
+    // =========================================================================
+    println!("\n{sep}");
+    println!("structural groups  (identical IFD count + per-position compression + dimensions)");
+    println!("{sep}");
+
+    // Group files by structural signature.
+    let mut sig_groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for p in &profiles {
+        sig_groups.entry(structural_signature(p)).or_default().push(p.file_id);
+    }
+
+    // Sort groups by descending size, then by signature string.
+    let mut groups: Vec<(String, Vec<usize>)> = sig_groups.into_iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+    for (g_idx, (sig, members)) in groups.iter().enumerate() {
+        let count = members.len();
+        let word = if count == 1 { "file" } else { "files" };
+        println!("  group {}  ({count} {word})  {sig}", g_idx + 1);
+        for &fid in members {
+            let name = profiles
+                .iter()
+                .find(|p| p.file_id == fid)
+                .and_then(|p| p.path.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("?");
+            println!("    {name}");
+        }
+    }
+
+    // =========================================================================
+    // Section 5: Pairwise structural similarity
+    // =========================================================================
+    // Apply filters before deciding output path.
+    if let Some(thresh) = min_score {
+        scores.retain(|s| s.score >= thresh);
+    }
+    if let Some(n) = top_pairs {
+        scores.truncate(n);
+    }
+
+    if json {
+        let dir_name = std::path::Path::new(dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("corpus");
+        let out_name = format!("similarity_{dir_name}.json");
+        let mut out_file = File::create(&out_name)
+            .map_err(|e| format!("{out_name}: {e}"))?;
+        write_structural_json(&mut out_file, &profiles, &scores)
+            .map_err(|e| format!("{out_name}: {e}"))?;
+        println!("\nwrote {out_name}");
+    } else {
+        let filter_note = min_score
+            .map(|t| format!("  (min-score ≥ {t:.3})"))
+            .unwrap_or_default();
+        let top_note = top_pairs
+            .map(|n| format!("  (top {n})"))
+            .unwrap_or_default();
+
+        println!("\n{sep}");
+        println!("pairwise structural similarity{filter_note}{top_note}");
+        println!("formula: {}", formula_description());
+        println!("{sep}");
+        println!(
+            "  {:<6}  {:<5}  {:<6}  {:<5}  {:<28}  {}",
+            "score", "ifd", "struct", "desc", "file_a", "file_b"
+        );
+        println!("  {}", "─".repeat(73));
+
+        if scores.is_empty() {
+            println!("  (no pairs match the current filters)");
+        } else {
+            for s in &scores {
+                let name_a = profiles
+                    .iter()
+                    .find(|p| p.file_id == s.file_id_a)
+                    .and_then(|p| p.path.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?");
+                let name_b = profiles
+                    .iter()
+                    .find(|p| p.file_id == s.file_id_b)
+                    .and_then(|p| p.path.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?");
+                println!(
+                    "  {:.4}  {:.3}  {:.4}  {:.3}  {:<28.28}  {}",
+                    s.score, s.ifd_count_score, s.structure_score, s.description_score,
+                    name_a, name_b,
+                );
+            }
+        }
     }
 
     // ── warnings ─────────────────────────────────────────────────────────────
@@ -1071,6 +1118,48 @@ fn cmd_similarity(dir: &str, confirm: bool, workers: usize) -> Result<(), String
     }
 
     Ok(())
+}
+
+/// Print a compact distribution summary to stdout (no newline appended).
+///
+/// Shows the top values sorted by descending count.  If there is only one
+/// distinct value and it covers all entries, prints "value (all N)".
+/// Otherwise lists top entries as "v1 (k1), v2 (k2), ..." with a "+N more"
+/// tail when there are many.
+fn print_dist_compact<K, F>(dist: &std::collections::BTreeMap<K, usize>, total: usize, label: F)
+where
+    K: Ord,
+    F: Fn(&K) -> String,
+{
+    if dist.is_empty() {
+        print!("(none)");
+        return;
+    }
+    // Sort by descending count.
+    let mut entries: Vec<(&K, usize)> = dist.iter().map(|(k, &v)| (k, v)).collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if entries.len() == 1 {
+        let (k, count) = entries[0];
+        if count == total {
+            print!("{} (all {})", label(k), total);
+        } else {
+            print!("{} ({}/{})", label(k), count, total);
+        }
+        return;
+    }
+
+    // Show top 3, then "+N more".
+    const SHOW: usize = 3;
+    let shown = entries.len().min(SHOW);
+    let parts: Vec<String> = entries[..shown]
+        .iter()
+        .map(|(k, count)| format!("{} ({}/{})", label(k), count, total))
+        .collect();
+    print!("{}", parts.join("  |  "));
+    if entries.len() > SHOW {
+        print!("  +{} more", entries.len() - SHOW);
+    }
 }
 
 fn compression_label(code: u16) -> String {

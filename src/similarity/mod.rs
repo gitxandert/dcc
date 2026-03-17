@@ -16,6 +16,7 @@
 pub mod profile;
 pub mod corpus;
 pub mod structural;
+pub mod archetype;
 
 pub mod overlap;
 pub mod metric;

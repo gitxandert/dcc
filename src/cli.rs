@@ -827,9 +827,8 @@ fn cmd_similarity(
     json: bool,
 ) -> Result<(), String> {
     use crate::similarity::corpus::compute_corpus_stats;
-    use crate::similarity::profile::{build_profile, structural_signature};
+    use crate::similarity::profile::build_profile;
     use crate::similarity::structural::{formula_description, score_all_pairs};
-    use std::collections::BTreeMap;
 
     // ── collect .svs paths ───────────────────────────────────────────────────
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("{dir}: {e}"))?;
@@ -958,27 +957,6 @@ fn cmd_similarity(
     println!("description patterns");
     println!("{sep}");
 
-    // Scanner / preamble distribution.
-    if !stats.preamble_freq.is_empty() {
-        println!("  scanner / preamble (text before first '|'):");
-        let mut preambles: Vec<(&str, usize)> = stats
-            .preamble_freq
-            .iter()
-            .map(|(k, &v)| (k.as_str(), v))
-            .collect();
-        preambles.sort_by(|a, b| b.1.cmp(&a.1));
-        for (pre, count) in &preambles {
-            println!(
-                "    {:>2}/{} files  \"{}\"",
-                count,
-                profiles.len(),
-                truncate(pre, 55)
-            );
-        }
-    } else {
-        println!("  (no ImageDescription fields found in any file)");
-    }
-
     // Token frequency: tokens shared by >=2 files.
     let common = stats.common_tokens(2);
     if !common.is_empty() {
@@ -1011,41 +989,115 @@ fn cmd_similarity(
             println!("  tokens unique to one file ({}): {sample}", unique_tokens.len());
         }
     }
-
+    
     // =========================================================================
-    // Section 4: Structural groups
+    // Section 4: Metadata archetypes
     // =========================================================================
-    println!("\n{sep}");
-    println!("structural groups  (identical IFD count + per-position compression + dimensions)");
-    println!("{sep}");
+    {
+        use crate::similarity::archetype::derive_archetypes;
 
-    // Group files by structural signature.
-    let mut sig_groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for p in &profiles {
-        sig_groups.entry(structural_signature(p)).or_default().push(p.file_id);
-    }
+        let nodes = derive_archetypes(&profiles);
 
-    // Sort groups by descending size, then by signature string.
-    let mut groups: Vec<(String, Vec<usize>)> = sig_groups.into_iter().collect();
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        println!("\n{sep}");
+        let archetype_word = if nodes.len() == 1 { "archetype" } else { "archetypes" };
+        println!("metadata archetypes  ({} {archetype_word}, {} files)", nodes.len(), profiles.len());
+        println!("{sep}");
 
-    for (g_idx, (sig, members)) in groups.iter().enumerate() {
-        let count = members.len();
-        let word = if count == 1 { "file" } else { "files" };
-        println!("  group {}  ({count} {word})  {sig}", g_idx + 1);
-        for &fid in members {
-            let name = profiles
-                .iter()
-                .find(|p| p.file_id == fid)
-                .and_then(|p| p.path.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("?");
-            println!("    {name}");
+        // Short label: A, B, C … Z, A2, B2 …
+        let label_of = |id: usize| -> String {
+            let ch = (b'A' + (id % 26) as u8) as char;
+            if id < 26 { ch.to_string() } else { format!("{ch}{}", id / 26) }
+        };
+
+        // Find the first archetype whose token set equals `tokens`, for
+        // "same tokens as X" back-references.
+        let first_with_tokens =
+            |tokens: &std::collections::BTreeSet<String>, exclude_id: usize| -> Option<usize> {
+                nodes
+                    .iter()
+                    .find(|n| n.archetype.id != exclude_id && &n.archetype.common_tokens == tokens)
+                    .map(|n| n.archetype.id)
+            };
+
+        for node in &nodes {
+            let a = &node.archetype;
+            let lbl = label_of(a.id);
+            let nf = a.member_count();
+            let files_word = if nf == 1 { "file" } else { "files" };
+
+            println!("  archetype {}  ({nf} {files_word}, {} IFDs)", lbl, a.skeleton.ifd_count);
+
+            // IFD structure — show compression + tiling runs (no dimensions).
+            // Collapse consecutive identical slots into a range for brevity.
+            let skel = &a.skeleton;
+            if !skel.per_ifd.is_empty() {
+                // Build runs of (start, end, compression_label, layout_label, role).
+                struct Run {
+                    start: usize,
+                    end: usize,
+                    comp: String,
+                    layout: String,
+                    role: Option<String>,
+                }
+                let mut runs: Vec<Run> = Vec::new();
+                for (pos, ifd) in skel.per_ifd.iter().enumerate() {
+                    let comp = match ifd.compression {
+                        Some(c) => compression_label(c),
+                        None => "untagged".to_string(),
+                    };
+                    let layout = match (ifd.tile_width, ifd.tile_height) {
+                        (Some(tw), Some(th)) => format!("tiled {tw}\u{d7}{th}"),
+                        _ => "strip".to_string(),
+                    };
+                    let role = ifd.role.clone();
+                    if let Some(last) = runs.last_mut() {
+                        if last.comp == comp && last.layout == layout && last.role == role {
+                            last.end = pos;
+                            continue;
+                        }
+                    }
+                    runs.push(Run { start: pos, end: pos, comp, layout, role });
+                }
+                for r in &runs {
+                    let pos_label = if r.start == r.end {
+                        format!("IFD {}", r.start)
+                    } else {
+                        format!("IFD {}\u{2013}{}", r.start, r.end)
+                    };
+                    let role_note = r.role.as_deref().map(|s| format!("  [{s}]")).unwrap_or_default();
+                    println!("    {pos_label}:  {}  {}{role_note}", r.comp, r.layout);
+                }
+            }
+
+            // Common tokens — show full list, or "same as X" if identical to an
+            // earlier archetype.
+            let n_tok = a.common_tokens.len();
+            let n_var = a.variable_tokens.len();
+            if n_tok == 0 && n_var == 0 {
+                println!("    tokens: (none)");
+            } else {
+                let same_as = first_with_tokens(&a.common_tokens, a.id);
+                if let Some(other_id) = same_as {
+                    println!("    tokens ({n_tok} common): [same as {}]", label_of(other_id));
+                } else {
+                    let list: Vec<&str> = a.common_tokens.iter().map(String::as_str).collect();
+                    let shown = list.iter().take(12).cloned().collect::<Vec<_>>().join(", ");
+                    let rest = n_tok.saturating_sub(12);
+                    if rest > 0 {
+                        println!("    tokens ({n_tok} common): {shown}, +{rest} more");
+                    } else {
+                        println!("    tokens ({n_tok} common): {shown}");
+                    }
+                }
+                if n_var > 0 {
+                    println!("    tokens ({n_var} variable, not shown)");
+                }
+            }
         }
     }
 
     // =========================================================================
-    // Section 5: Pairwise structural similarity
+    // Section 7: Pairwise structural similarity
     // =========================================================================
     // Apply filters before deciding output path.
     if let Some(thresh) = min_score {

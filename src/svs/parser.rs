@@ -192,7 +192,7 @@ pub fn parse_ifd_chain<R: Read + Seek>(
 ///   [4..6]   bytesize of offsets (always 8)
 ///   [6..8]   reserved         (always 0)
 ///   [8..16]  offset of first IFD (u64)
-fn parse_bigtiff_header<R: Read + Seek>(
+pub(crate) fn parse_bigtiff_header<R: Read + Seek>(
     r: &mut R,
 ) -> Result<(ByteOrder, u64), ParseError> {
     r.seek(SeekFrom::Start(0))?;
@@ -265,7 +265,7 @@ fn parse_bigtiff_ifd<R: Read + Seek>(
 }
 
 /// Traverse the full BigTIFF IFD chain starting at `first_offset`.
-fn parse_bigtiff_ifd_chain<R: Read + Seek>(
+pub(crate) fn parse_bigtiff_ifd_chain<R: Read + Seek>(
     r: &mut R,
     first_offset: u64,
     byte_order: ByteOrder,

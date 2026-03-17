@@ -1,3 +1,4 @@
+pub mod arch;
 pub mod cli;
 pub mod svs;
 pub mod fingerprint;
